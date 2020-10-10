@@ -42,14 +42,14 @@ my %MYQ_DEFAULT_TIMER = (
 
 # status definitions
 use constant { 
-	MYQ_offline => 'offline',
-	MYQ_unauthorized => 'unauthorized', 
-	MYQ_no_device => 'no_device', 
-	MYQ_unknown => 'unknown', 
-	MYQ_closed => 'closed', 
-	MYQ_open => 'open', 
-	MYQ_closing => 'closing', 
-	MYQ_opening => 'opening'
+	MYQ_ST_offline => 'offline',
+	MYQ_ST_unauthorized => 'unauthorized', 
+	MYQ_ST_no_device => 'no_device', 
+	MYQ_ST_unknown => 'unknown', 
+	MYQ_ST_closed => 'closed', 
+	MYQ_ST_open => 'open', 
+	MYQ_ST_closing => 'closing', 
+	MYQ_ST_opening => 'opening'
 }; 
 
 my %MYQ_HEADERS = (
@@ -97,16 +97,14 @@ sub MyQ_Define($$) {
     $hash->{INTERNALS}->{password} = $password;
    	$attr{$name}{'device'} = $device if ($device);
 
-    MyQ_updateStatus($hash, MYQ_offline); # until we know better...
-
     # initialize readings on 1st define
-#    if ($init_done) {
-#        readingsBeginUpdate($hash);
-#        for my $reading (values %MyQ_readingsMap) {
-#            readingsBulkUpdate($hash, $reading, '');
-#        }
-#        readingsEndUpdate($hash, false);
-#    }
+    if ($init_done) {
+    	readingsBeginUpdate($hash);
+        MyQ_updateStatus($hash, MYQ_ST_offline, true); # until we know better...
+        MyQ_updateReading($hash, 'last_ack', '');
+        MyQ_updateReading($hash, 'state_since', '');
+        readingsEndUpdate($hash, false);
+    }
 
     # start the timer for polling the status right now
     InternalTimer(gettimeofday(), \&MyQ_timer, $hash);
@@ -137,14 +135,20 @@ sub MyQ_Attr($$$@) {
     MyQ_log($name, 5, "MyQ_Attr($cmd, $attr, " . join(', ', @args) . ')');
     
     if (defined $MYQ_DEFAULT_TIMER{$attr}) {
-        if (@args != 1 || $args[0] <= 0) {
-        	return "cannot set attribute '$attr' to (" . join(', ', @args) . ")";
-        } elsif ($attr eq $hash->{current_timer}) {
- 	    	MyQ_updateTimer($hash, $args[0]);
+    	my $newval;
+    	if ($cmd eq 'del' && @args == 0) {
+    		$newval = $MYQ_DEFAULT_TIMER{$attr}; 
+    	} elsif (@args == 1 && $args[0] > 0) {
+        	$newval = $args[0];
+        } else {
+ 	    	return "cannot '$cmd' attribute '$attr' to (" . join(', ', @args) . ")";
+   	    }
+   	    if ($attr eq $hash->{current_timer}) {
+            MyQ_updateTimer($hash, $newval);
    	    }
     } elsif ($attr eq 'device' && @args == 1) {
     	$hash->{device} = undef;
-    	MyQ_updateStatus($hash, MYQ_no_device);
+    	MyQ_updateStatus($hash, MYQ_ST_no_device);
     	MyQ_determineNextCommand($hash);
     }
     return undef; 
@@ -175,7 +179,7 @@ sub MyQ_Set($@) {
         } elsif ($hash->{device_id}) {
     	   MyQ_getHttpAsync($hash, $hash->{device_resource} . '/' . $hash->{device_id} . '/' . MYQ_R_ACTION, 
     	       { action_type =>" $cmd" });
-    	   MyQ_updateStatus($hash, $cmd eq 'open' ? MYQ_opening : MYQ_closing);
+    	   MyQ_updateStatus($hash, $cmd eq 'open' ? MYQ_ST_opening : MYQ_ST_closing);
     	} else {
     		MyQ_log($name, 2, "cannot perform command $cmd, no device");
     	}
@@ -234,15 +238,19 @@ sub MyQ_parseHttpResponse($) {
     delete $hash->{running_http_req};
 
     MyQ_log($hash->{NAME}, 5, "received code: $param->{code} response: $data");
-    if ($err || $param->{code} >= 400)  {
-    	delete $hash->{security_token} if $param->{code} == 401;
-        MyQ_log($hash->{NAME}, 3, "error while requesting " . $param->{url} . " - $err ($param->{code})");
-        MyQ_updateStatus($hash, MYQ_unknown);
-    } elsif ($data) {
-    	if (!MyQ_processResponse($hash, $param->{resource}, from_json($data))) {
-            MyQ_log($hash->{NAME}, 3, "couldn't handle $param->{url} response: $data");
-    	}
-    }
+    eval {
+	    if ($err || $param->{code} >= 400)  {
+	        MyQ_log($hash->{NAME}, 3, "error while requesting " . $param->{url} . " - $err ($param->{code})");
+	        MyQ_updateStatus($hash, MYQ_ST_unknown);
+	    } elsif ($data) {
+	    	if (!MyQ_processResponse($hash, $param->{resource}, from_json($data))) {
+	            MyQ_log($hash->{NAME}, 3, "couldn't handle $param->{url} response: $data");
+	    	}
+	    }
+	    1;
+    } or do {
+    	MyQ_log($hash->{NAME}, 2, "fatal error processing responce: $@");
+    };
 }
 
 sub MyQ_processResponse($$$) {
@@ -253,7 +261,7 @@ sub MyQ_processResponse($$$) {
     		MyQ_determineNextCommand($hash);
     		return true;
     	} else {
-            MyQ_updateStatus(MYQ_unauthorized);
+            MyQ_updateStatus(MYQ_ST_unauthorized);
     	}
     } elsif ($resource eq MYQ_R_MAIN) {
     	if ($hash->{account_id} = $response->{Account}->{Id}) {
@@ -273,7 +281,7 @@ sub MyQ_processResponse($$$) {
         if ($fixed) {
             MyQ_log($hash->{NAME}, 2, "couldn't find specified device: $fixed");
         } else {
-        	MyQ_updateStatus($hash, MYQ_no_device);
+        	MyQ_updateStatus($hash, MYQ_ST_no_device);
         }
     } elsif ($resource eq $hash->{device_resource} . '/' . $hash->{device_id}) {
     	return MyQ_updateDeviceReadings($hash, $response);
@@ -283,16 +291,21 @@ sub MyQ_processResponse($$$) {
 }
 
 sub MyQ_updateDeviceReadings($$) {
-	my ($hash, $response) = @_; 
-    if ($response->{device_type} ne MYQ_DEVICE_TYPE) {
-        MyQ_log($hash->{NAME}, 3, "warning: device type $response->{device_type} may be unsupported");
-    }
-    my $state = $response->{state}->{door_state};
-    if ($state) {
-	    MyQ_updateStatus($hash, $state);
-	    # TODO extract some readings:
-	    return true;
-    }
+	my ($hash, $response) = @_;
+	if ($response) { 
+	    if ($response->{device_type} ne MYQ_DEVICE_TYPE) {
+	        MyQ_log($hash->{NAME}, 3, "warning: device type $response->{device_type} may be unsupported");
+	    }
+	    my $state = $response->{state};
+	    if ($state && $state->{door_state}) {
+	    	readingsBeginUpdate($hash);
+		    MyQ_updateStatus($hash, $state->{door_state}, true);
+		    MyQ_updateReading($hash, 'state_since', $state->{last_update});
+	        MyQ_updateReading($hash, 'last_ack', $state->{last_status});
+	        readingsEndUpdate($hash, false);
+		    return true;
+	    }
+	}
     return false;
 }
 
@@ -310,9 +323,10 @@ sub MyQ_determineNextCommand($) {
 	}
 }
 
-sub MyQ_updateStatus($$) {
-    my ($hash, $status) = @_;
+sub MyQ_updateStatus($$;$) {
+    my ($hash, $status, $bulk) = @_;
     $hash->{STATE} = $status;
+    MyQ_updateReading($hash, 'state', $status, !$bulk);
     my $timer = MyQ_whichTimer($status);
     $hash->{current_timer} = $timer;
     my $time = AttrVal($hash->{NAME}, $timer, $MYQ_DEFAULT_TIMER{$timer});
@@ -321,9 +335,9 @@ sub MyQ_updateStatus($$) {
 
 sub MyQ_whichTimer($) {
 	my ($status) = @_;
-	if ($status eq MYQ_offline || $status eq MYQ_unauthorized || $status eq MYQ_no_device) {
+	if ($status eq MYQ_ST_offline || $status eq MYQ_ST_unauthorized || $status eq MYQ_ST_no_device) {
         return 'slow_timer';
-    } elsif ($status eq MYQ_opening || $status eq MYQ_closing) {
+    } elsif ($status eq MYQ_ST_opening || $status eq MYQ_ST_closing) {
         return 'fast_timer';
     } else {
     	return 'timer';
@@ -360,6 +374,22 @@ sub MyQ_timer($) {
 # Independent helper functions
 # ----------------------------------------------------------------------------
 
+# update a reading value (bulk update) only if it has changed
+sub MyQ_updateReading($$$;$) {
+    my ($hash, $reading, $value, $single) = @_;
+    my $name = $hash->{NAME};
+    my $old = ReadingsVal($name, $reading, undef);
+    if (defined $old ? (!defined $value || $old ne $value) : defined $value) {
+        if ($single) {
+            readingsSingleUpdate($hash, $reading, $value, true);
+        } else {   
+            readingsBulkUpdate($hash, $reading, $value);
+        }
+        return true;
+    } else {
+        return false;
+    }
+}
 # log with escaped non-printable chars
 sub MyQ_log($$;$) {
     my $name = shift if (@_ >= 3);
